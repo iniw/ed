@@ -1,4 +1,12 @@
-use std::{env, fs, io::stdin, iter::Peekable, ops::RangeInclusive, str::CharIndices};
+use std::{
+    env,
+    fs::File,
+    io::{self, BufRead, BufReader, stdin},
+    iter::Peekable,
+    ops::RangeInclusive,
+    os::unix::fs::MetadataExt,
+    str::CharIndices,
+};
 
 #[derive(Default)]
 struct Args {
@@ -7,7 +15,7 @@ struct Args {
 }
 
 impl Args {
-    fn parse(args: env::Args) -> Result<Self, &'static str> {
+    fn parse(args: env::Args) -> Result<Self> {
         let mut out = Self::default();
 
         for arg in args.skip(1) {
@@ -26,32 +34,32 @@ impl Args {
     }
 }
 
-fn main() -> Result<(), &'static str> {
+fn main() -> Result<()> {
     let args = Args::parse(env::args())?;
 
     let Some(file_path) = args.file_path else {
         return Err("File path argument must be provided");
     };
 
-    let Ok(file) = fs::read_to_string(&file_path) else {
-        return Err("Failed to read file from disk");
+    let Ok(file) = File::open(&file_path) else {
+        return Err("Failed to open file from disk");
     };
 
-    println!("{}", file.len());
+    if let Ok(metadata) = file.metadata() {
+        println!("{}", metadata.size());
+    }
 
-    let mut lines = file.lines().collect::<Vec<_>>();
-
-    let mut state = State { cursor: 0 };
+    let mut state = Editor::from_file(file);
 
     loop {
-        let mut cmd = String::new();
-        match stdin().read_line(&mut cmd) {
+        let mut input = String::new();
+        match stdin().read_line(&mut input) {
             // 'If this function returns `Ok(0)`, the stream has reached EOF.'
             Ok(0) => break,
             Ok(_) => (),
             Err(err) => {
                 if args.debug {
-                    eprintln!("Failed to read line: {:?}", err);
+                    eprintln!("Failed to read line: {err:?}");
                 }
                 println!("?");
                 continue;
@@ -59,150 +67,212 @@ fn main() -> Result<(), &'static str> {
         };
 
         // Strip off the newline
-        let cmd = &cmd[..cmd.len() - 1];
+        let input = &input[..input.len() - 1];
 
-        match parse_cmd(cmd).and_then(|cmd| execute_cmd(&mut lines, &mut state, cmd)) {
-            Ok(_) => {}
-            Err(err) => {
-                if args.debug {
-                    eprintln!("Error: {:?}", err);
-                }
-                println!("?");
-                continue;
+        if let Err(err) = state.interpret(input) {
+            if args.debug {
+                eprintln!("Error: {err:?}");
             }
+            println!("?");
         }
     }
 
     Ok(())
 }
 
-fn execute_cmd(lines: &mut Vec<&str>, state: &mut State, cmd: Cmd) -> Result<(), &'static str> {
-    let range_from_addr = |addr: Option<Addr>| -> Result<RangeInclusive<usize>, &'static str> {
-        let addr_kind_range = |addr_kind: AddrKind| {
-            let n = match addr_kind {
-                AddrKind::Dollar => lines.len(),
-                AddrKind::Number(addr) => addr,
-            };
-            if n == 0 || n > lines.len() {
-                Err("Out of bounds")
-            } else {
-                Ok(n - 1)
-            }
-        };
+#[derive(Debug)]
+struct Editor {
+    current_address: usize,
+    lines: Lines,
+}
 
-        match addr {
-            None if state.cursor >= lines.len() => Err("Out of bounds"),
-            None => Ok(state.cursor..=state.cursor),
-            Some(addr) => match addr {
-                Addr::Single(addr) => {
-                    let range = addr_kind_range(addr)?;
-                    Ok(range..=range)
+impl Editor {
+    pub fn from_file(file: File) -> Self {
+        let lines = BufReader::new(file)
+            .lines()
+            .map_while(io::Result::<String>::ok)
+            .collect::<Lines>();
+
+        Self {
+            current_address: lines.len(),
+            lines,
+        }
+    }
+
+    pub fn interpret(&mut self, input: &str) -> Result<()> {
+        let command = Command::parse(input)?;
+        self.execute(command)
+    }
+
+    fn execute(&mut self, command: Command) -> Result<()> {
+        let resolved_address = self.resolve_address(&command);
+
+        let range = resolved_address.to_range(self.lines.len())?;
+        let addressed_lines = &mut self.lines[range];
+
+        match command.kind {
+            CommandToken::Print => {
+                println!("{}", addressed_lines.join("\n"));
+            }
+            CommandToken::PrintAndSet => {
+                println!("{}", addressed_lines.join("\n"));
+            }
+        }
+
+        self.current_address = resolved_address.end;
+
+        Ok(())
+    }
+
+    fn resolve_address(&self, command: &Command) -> ResolvedAddress {
+        let n_lines = self.lines.len();
+
+        match &command.address {
+            None => match command.kind {
+                CommandToken::Print => ResolvedAddress::single(self.current_address),
+                CommandToken::PrintAndSet => ResolvedAddress::single(self.current_address + 1),
+            },
+            Some(address) => match address {
+                Address::Single(single) => {
+                    let range = single.resolve(n_lines);
+                    ResolvedAddress::single(range)
                 }
-                Addr::Range { begin, end } => Ok(addr_kind_range(begin)?..=addr_kind_range(end)?),
+                Address::Range { start, end } => {
+                    let start = start.resolve(n_lines);
+                    let end = end.resolve(n_lines);
+                    ResolvedAddress { start, end }
+                }
             },
         }
-    };
-
-    let range = range_from_addr(cmd.addr)?;
-    let end = *range.end();
-
-    match cmd.kind {
-        CmdKind::Print => {
-            println!("{}", lines[range].join("\n"));
-        }
-        CmdKind::PrintAndMove => {
-            println!("{}", lines[range].join("\n"));
-            state.cursor = end + 1;
-        }
     }
-
-    Ok(())
 }
+
+type InputStream<'a> = Peekable<CharIndices<'a>>;
 
 #[derive(Debug)]
-struct State {
-    cursor: usize,
+struct Command {
+    address: Option<Address>,
+    kind: CommandToken,
 }
 
-type Stream<'a> = Peekable<CharIndices<'a>>;
+impl Command {
+    pub fn parse(input: &str) -> Result<Command> {
+        let mut stream = input.char_indices().peekable();
 
-fn parse_cmd(line: &str) -> Result<Cmd, &'static str> {
-    let mut stream = line.char_indices().peekable();
+        let address = Address::parse(&mut stream, input)?;
+        let kind = CommandToken::parse(&mut stream)?;
 
-    let addr = parse_addr(line, &mut stream)?;
-    let kind = parse_cmd_kind(&mut stream);
-
-    Ok(Cmd { addr, kind })
-}
-
-fn parse_addr(line: &str, stream: &mut Stream) -> Result<Option<Addr>, &'static str> {
-    fn parse_addr_kind(line: &str, stream: &mut Stream) -> Result<Option<AddrKind>, &'static str> {
-        match stream.peek().copied() {
-            None => Ok(None),
-            Some((_, '$')) => {
-                // Consume the dollar sign
-                stream.next();
-                Ok(Some(AddrKind::Dollar))
-            }
-            Some((begin, '0'..='9')) => {
-                let mut end = begin;
-                while let Some((off, _)) = stream.next_if(|(_, c)| matches!(c, '0'..='9')) {
-                    end = off;
-                }
-
-                let Ok(number) = line[begin..=end].parse() else {
-                    return Err("Failed to parse numeric address");
-                };
-
-                Ok(Some(AddrKind::Number(number)))
-            }
-            Some(_) => Ok(None),
+        match stream.next() {
+            None => Ok(Command { address, kind }),
+            Some(_) => Err("Extra characters in stream"),
         }
-    }
-
-    let Some(begin) = parse_addr_kind(line, stream)? else {
-        return Ok(None);
-    };
-
-    let addr = match stream.next_if(|(_, c)| *c == ',') {
-        None => Addr::Single(begin),
-        Some(_) => match parse_addr_kind(line, stream)? {
-            None => Addr::Single(begin),
-            Some(end) => Addr::Range { begin, end },
-        },
-    };
-
-    Ok(Some(addr))
-}
-
-fn parse_cmd_kind(stream: &mut Stream) -> CmdKind {
-    match stream.next().map(|(_, c)| c) {
-        None => CmdKind::PrintAndMove,
-        Some('p') => CmdKind::Print,
-        other => todo!("No cmd for {:?}", other),
     }
 }
 
 #[derive(Debug)]
-struct Cmd {
-    addr: Option<Addr>,
-    kind: CmdKind,
+enum Address {
+    Single(AddressToken),
+    Range {
+        start: AddressToken,
+        end: AddressToken,
+    },
 }
 
-#[derive(Debug)]
-enum Addr {
-    Single(AddrKind),
-    Range { begin: AddrKind, end: AddrKind },
+impl Address {
+    pub fn parse(stream: &mut InputStream, command: &str) -> Result<Option<Self>> {
+        let Some(start) = AddressToken::parse(stream, command)? else {
+            return Ok(None);
+        };
+
+        let address = match stream.next_if(|(_, c)| *c == ',') {
+            None => Address::Single(start),
+            Some(_) => match AddressToken::parse(stream, command)? {
+                None => Address::Single(start),
+                Some(end) => Address::Range { start, end },
+            },
+        };
+
+        Ok(Some(address))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
-enum AddrKind {
+enum AddressToken {
     Dollar,
     Number(usize),
 }
 
-#[derive(Debug)]
-enum CmdKind {
-    Print,
-    PrintAndMove,
+impl AddressToken {
+    pub fn parse(stream: &mut InputStream, command: &str) -> Result<Option<Self>> {
+        match stream.next_if(|(_, c)| matches!(c, '$' | '0'..='9')) {
+            None => Ok(None),
+            Some((_, '$')) => Ok(Some(AddressToken::Dollar)),
+            Some((begin, '0'..='9')) => {
+                let mut end = begin;
+                #[allow(clippy::manual_is_ascii_check)]
+                while let Some((offset, _)) = stream.next_if(|(_, c)| matches!(c, '0'..='9')) {
+                    end = offset;
+                }
+
+                let Ok(number) = command[begin..=end].parse() else {
+                    return Err("Failed to parse numeric address");
+                };
+
+                Ok(Some(AddressToken::Number(number)))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn resolve(self, n_lines: usize) -> usize {
+        match self {
+            AddressToken::Dollar => n_lines,
+            AddressToken::Number(addr) => addr,
+        }
+    }
 }
+
+#[derive(Debug)]
+enum CommandToken {
+    Print,
+    PrintAndSet,
+}
+
+impl CommandToken {
+    pub fn parse(stream: &mut InputStream) -> Result<CommandToken> {
+        match stream.next().map(|(_, c)| c) {
+            None => Ok(CommandToken::PrintAndSet),
+            Some('p') => Ok(CommandToken::Print),
+            _ => Err("Unknown command"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedAddress {
+    start: usize,
+    end: usize,
+}
+
+impl ResolvedAddress {
+    fn single(range: usize) -> Self {
+        Self {
+            start: range,
+            end: range,
+        }
+    }
+
+    fn to_range(self, n_lines: usize) -> Result<RangeInclusive<usize>> {
+        let validate = |address: usize| address != 0 && address <= n_lines;
+
+        if validate(self.start) && validate(self.end) {
+            Ok(self.start - 1..=self.end - 1)
+        } else {
+            Err("Out of bounds")
+        }
+    }
+}
+
+type Lines = Vec<String>;
+
+type Result<T> = std::result::Result<T, &'static str>;
