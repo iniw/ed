@@ -8,6 +8,54 @@ use std::{
     str::CharIndices,
 };
 
+fn main() -> Result<()> {
+    let args = Args::parse(env::args())?;
+
+    let Some(file_path) = args.file_path else {
+        return Err("File path argument must be provided");
+    };
+
+    let Ok(file) = File::open(&file_path) else {
+        return Err("Failed to open file from disk");
+    };
+
+    let Ok(metadata) = file.metadata() else {
+        return Err("Failed to query file metadata");
+    };
+
+    println!("{}", metadata.size());
+
+    let mut editor = Editor::from_file(file);
+
+    loop {
+        let mut input = String::new();
+        match stdin().read_line(&mut input) {
+            // 'If this function returns `Ok(0)`, the stream has reached EOF.'
+            Ok(0) => break,
+            Ok(_) => (),
+            Err(err) => {
+                if args.debug {
+                    eprintln!("Failed to read line: {err}");
+                }
+                println!("?");
+                continue;
+            }
+        };
+
+        // Strip off the newline
+        let input = &input[..input.len() - 1];
+
+        if let Err(err) = editor.interpret(input) {
+            if args.debug {
+                eprintln!("Error: {err}");
+            }
+            println!("?");
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Default)]
 struct Args {
     file_path: Option<String>,
@@ -34,64 +82,18 @@ impl Args {
     }
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse(env::args())?;
-
-    let Some(file_path) = args.file_path else {
-        return Err("File path argument must be provided");
-    };
-
-    let Ok(file) = File::open(&file_path) else {
-        return Err("Failed to open file from disk");
-    };
-
-    if let Ok(metadata) = file.metadata() {
-        println!("{}", metadata.size());
-    }
-
-    let mut editor = Editor::from_file(file);
-
-    loop {
-        let mut input = String::new();
-        match stdin().read_line(&mut input) {
-            // 'If this function returns `Ok(0)`, the stream has reached EOF.'
-            Ok(0) => break,
-            Ok(_) => (),
-            Err(err) => {
-                if args.debug {
-                    eprintln!("Failed to read line: {err:?}");
-                }
-                println!("?");
-                continue;
-            }
-        };
-
-        // Strip off the newline
-        let input = &input[..input.len() - 1];
-
-        if let Err(err) = editor.interpret(input) {
-            if args.debug {
-                eprintln!("Error: {err:?}");
-            }
-            println!("?");
-        }
-    }
-
-    Ok(())
-}
-
 #[derive(Debug)]
 struct Editor {
     current_address: usize,
-    lines: Lines,
+    lines: Vec<String>,
 }
 
 impl Editor {
     pub fn from_file(file: File) -> Self {
         let lines = BufReader::new(file)
             .lines()
-            .map_while(io::Result::<String>::ok)
-            .collect::<Lines>();
+            .map_while(io::Result::ok)
+            .collect::<Vec<String>>();
 
         Self {
             current_address: lines.len(),
@@ -159,8 +161,6 @@ impl Editor {
     }
 }
 
-type InputStream<'a> = Peekable<CharIndices<'a>>;
-
 #[derive(Debug)]
 struct Command {
     address: Option<Address>,
@@ -219,14 +219,15 @@ impl AddressToken {
         match stream.next_if(|(_, c)| matches!(c, '$' | '0'..='9')) {
             None => Ok(None),
             Some((_, '$')) => Ok(Some(AddressToken::Dollar)),
-            Some((begin, '0'..='9')) => {
-                let mut end = begin;
+            Some((start, '0'..='9')) => {
+                let mut end = start;
+
                 #[allow(clippy::manual_is_ascii_check)]
-                while let Some((offset, _)) = stream.next_if(|(_, c)| matches!(c, '0'..='9')) {
-                    end = offset;
+                while let Some((start, _)) = stream.next_if(|(_, c)| matches!(c, '0'..='9')) {
+                    end = start;
                 }
 
-                let Ok(number) = command[begin..=end].parse() else {
+                let Ok(number) = command[start..=end].parse() else {
                     return Err("Failed to parse numeric address");
                 };
 
@@ -253,6 +254,6 @@ impl CommandToken {
     }
 }
 
-type Lines = Vec<String>;
+type InputStream<'a> = Peekable<CharIndices<'a>>;
 
 type Result<T> = std::result::Result<T, &'static str>;
