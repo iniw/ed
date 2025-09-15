@@ -1,6 +1,6 @@
 use std::{
     env,
-    fs::File,
+    fs::{self, File},
     io::{self, BufRead, BufReader, stdin},
     iter::Peekable,
     ops::RangeInclusive,
@@ -11,21 +11,10 @@ use std::{
 fn main() -> Result<()> {
     let args = Args::parse(env::args())?;
 
-    let Some(file_path) = args.file_path else {
-        return Err("File path argument must be provided");
+    let mut editor = match args.file_path {
+        Some(file_path) => Editor::from_file(file_path)?,
+        None => Editor::blank(),
     };
-
-    let Ok(file) = File::open(&file_path) else {
-        return Err("Failed to open file from disk");
-    };
-
-    let Ok(metadata) = file.metadata() else {
-        return Err("Failed to query file metadata");
-    };
-
-    println!("{}", metadata.size());
-
-    let mut editor = Editor::from_file(file);
 
     loop {
         let mut input = String::new();
@@ -86,18 +75,36 @@ impl Args {
 struct Editor {
     current_address: usize,
     lines: Vec<String>,
+    default_filename: Option<String>,
 }
 
 impl Editor {
-    pub fn from_file(file: File) -> Self {
+    pub fn from_file(path: String) -> Result<Self> {
+        let Ok(file) = File::open(&path) else {
+            return Err("Failed to open file");
+        };
+
         let lines = BufReader::new(file)
             .lines()
             .map_while(io::Result::ok)
             .collect::<Vec<String>>();
 
-        Self {
+        if let Ok(metadata) = fs::metadata(&path) {
+            println!("{}", metadata.size());
+        }
+
+        Ok(Self {
             current_address: lines.len(),
             lines,
+            default_filename: Some(path),
+        })
+    }
+
+    pub fn blank() -> Self {
+        Self {
+            current_address: 1,
+            lines: Vec::new(),
+            default_filename: None,
         }
     }
 
@@ -108,19 +115,38 @@ impl Editor {
 
     fn execute(&mut self, command: Command) -> Result<()> {
         let range = self.resolve_address(&command)?;
-        let end = *range.end();
-        let addressed_lines = &mut self.lines[range];
 
         match command.kind {
             CommandToken::Print => {
-                println!("{}", addressed_lines.join("\n"));
+                println!("{}", self.lines[range.clone()].join("\n"));
+                self.current_address = *range.end() + 1;
             }
             CommandToken::PrintAndSet => {
-                println!("{}", addressed_lines.join("\n"));
+                println!("{}", self.lines[*range.start()]);
+                self.current_address = *range.end() + 1;
+            }
+            CommandToken::Edit(path) => {
+                *self = Editor::from_file(path.to_owned())?;
+            }
+            CommandToken::Write(path) => {
+                let Some(path) = path.or(self.default_filename.as_deref()) else {
+                    return Err("Missing path to write");
+                };
+
+                let mut contents = self.lines[range].join("\n");
+                if !contents.ends_with('\n') {
+                    contents.push('\n');
+                }
+
+                if let Err(_) = fs::write(path, &contents) {
+                    return Err("Failed to write file to disk");
+                }
+
+                println!("{}", contents.len());
+
+                self.default_filename = Some(path.to_owned());
             }
         }
-
-        self.current_address = end;
 
         Ok(())
     }
@@ -130,6 +156,9 @@ impl Editor {
             None => match command.kind {
                 CommandToken::Print => (self.current_address, self.current_address),
                 CommandToken::PrintAndSet => (self.current_address + 1, self.current_address + 1),
+                // FIXME: Get rid of this dummy range
+                CommandToken::Edit(_) => return Ok(0..=0),
+                CommandToken::Write(_) => (1, self.lines.len()),
             },
             Some(address) => match address {
                 Address::Single(single) => {
@@ -147,7 +176,7 @@ impl Editor {
         let validate = |address: usize| address != 0 && address <= self.lines.len();
 
         if validate(start) && validate(end) {
-            Ok(start..=end)
+            Ok(start - 1..=end - 1)
         } else {
             Err("Out of bounds")
         }
@@ -162,17 +191,17 @@ impl Editor {
 }
 
 #[derive(Debug)]
-struct Command {
+struct Command<'input> {
     address: Option<Address>,
-    kind: CommandToken,
+    kind: CommandToken<'input>,
 }
 
-impl Command {
-    pub fn parse(input: &str) -> Result<Command> {
+impl<'input> Command<'input> {
+    pub fn parse(input: &'input str) -> Result<Self> {
         let mut stream = input.char_indices().peekable();
 
         let address = Address::parse(&mut stream, input)?;
-        let kind = CommandToken::parse(&mut stream)?;
+        let kind = CommandToken::parse(&mut stream, input)?;
 
         match stream.next() {
             None => Ok(Command { address, kind }),
@@ -239,16 +268,34 @@ impl AddressToken {
 }
 
 #[derive(Debug)]
-enum CommandToken {
+enum CommandToken<'input> {
     Print,
     PrintAndSet,
+    Edit(&'input str),
+    Write(Option<&'input str>),
 }
 
-impl CommandToken {
-    pub fn parse(stream: &mut InputStream) -> Result<CommandToken> {
+impl<'input> CommandToken<'input> {
+    pub fn parse(stream: &mut InputStream, input: &'input str) -> Result<Self> {
+        let swallow = |stream: &mut InputStream| {
+            stream.next().map(|(start, _)| {
+                let mut end = start;
+                while let Some((start, _)) = stream.next() {
+                    end = start;
+                }
+                &input[start..=end]
+            })
+        };
         match stream.next().map(|(_, c)| c) {
             None => Ok(CommandToken::PrintAndSet),
             Some('p') => Ok(CommandToken::Print),
+            Some('e') => match swallow(stream) {
+                Some(path) => Ok(CommandToken::Edit(path.trim_start())),
+                None => Err("Missing path for `Edit`"),
+            },
+            Some('w') => Ok(CommandToken::Write(
+                swallow(stream).map(|path| path.trim_start()),
+            )),
             _ => Err("Unknown command"),
         }
     }
