@@ -49,7 +49,7 @@ fn main() -> Result<()> {
         println!("{}", metadata.size());
     }
 
-    let mut state = Editor::from_file(file);
+    let mut editor = Editor::from_file(file);
 
     loop {
         let mut input = String::new();
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
         // Strip off the newline
         let input = &input[..input.len() - 1];
 
-        if let Err(err) = state.interpret(input) {
+        if let Err(err) = editor.interpret(input) {
             if args.debug {
                 eprintln!("Error: {err:?}");
             }
@@ -105,9 +105,8 @@ impl Editor {
     }
 
     fn execute(&mut self, command: Command) -> Result<()> {
-        let resolved_address = self.resolve_address(&command);
-
-        let range = resolved_address.to_range(self.lines.len())?;
+        let range = self.resolve_address(&command)?;
+        let end = *range.end();
         let addressed_lines = &mut self.lines[range];
 
         match command.kind {
@@ -119,30 +118,43 @@ impl Editor {
             }
         }
 
-        self.current_address = resolved_address.end;
+        self.current_address = end;
 
         Ok(())
     }
 
-    fn resolve_address(&self, command: &Command) -> ResolvedAddress {
-        let n_lines = self.lines.len();
-
-        match &command.address {
+    fn resolve_address(&self, command: &Command) -> Result<RangeInclusive<usize>> {
+        let (start, end) = match command.address {
             None => match command.kind {
-                CommandToken::Print => ResolvedAddress::single(self.current_address),
-                CommandToken::PrintAndSet => ResolvedAddress::single(self.current_address + 1),
+                CommandToken::Print => (self.current_address, self.current_address),
+                CommandToken::PrintAndSet => (self.current_address + 1, self.current_address + 1),
             },
             Some(address) => match address {
                 Address::Single(single) => {
-                    let range = single.resolve(n_lines);
-                    ResolvedAddress::single(range)
+                    let single = self.resolve_address_token(single);
+                    (single, single)
                 }
                 Address::Range { start, end } => {
-                    let start = start.resolve(n_lines);
-                    let end = end.resolve(n_lines);
-                    ResolvedAddress { start, end }
+                    let start = self.resolve_address_token(start);
+                    let end = self.resolve_address_token(end);
+                    (start, end)
                 }
             },
+        };
+
+        let validate = |address: usize| address != 0 && address <= self.lines.len();
+
+        if validate(start) && validate(end) {
+            Ok(start..=end)
+        } else {
+            Err("Out of bounds")
+        }
+    }
+
+    fn resolve_address_token(&self, address_token: AddressToken) -> usize {
+        match address_token {
+            AddressToken::Dollar => self.lines.len(),
+            AddressToken::Number(addr) => addr,
         }
     }
 }
@@ -169,7 +181,7 @@ impl Command {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Address {
     Single(AddressToken),
     Range {
@@ -223,13 +235,6 @@ impl AddressToken {
             _ => unreachable!(),
         }
     }
-
-    pub fn resolve(self, n_lines: usize) -> usize {
-        match self {
-            AddressToken::Dollar => n_lines,
-            AddressToken::Number(addr) => addr,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -244,31 +249,6 @@ impl CommandToken {
             None => Ok(CommandToken::PrintAndSet),
             Some('p') => Ok(CommandToken::Print),
             _ => Err("Unknown command"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ResolvedAddress {
-    start: usize,
-    end: usize,
-}
-
-impl ResolvedAddress {
-    fn single(range: usize) -> Self {
-        Self {
-            start: range,
-            end: range,
-        }
-    }
-
-    fn to_range(self, n_lines: usize) -> Result<RangeInclusive<usize>> {
-        let validate = |address: usize| address != 0 && address <= n_lines;
-
-        if validate(self.start) && validate(self.end) {
-            Ok(self.start - 1..=self.end - 1)
-        } else {
-            Err("Out of bounds")
         }
     }
 }
