@@ -166,7 +166,7 @@ impl Editor {
                     contents.push('\n');
                 }
 
-                if let Err(_) = fs::write(path, &contents) {
+                if fs::write(path, &contents).is_err() {
                     return Err("Failed to write file to disk");
                 }
 
@@ -261,7 +261,7 @@ impl<'input> Command<'input> {
 
         match stream.next() {
             None => Ok(Command { address, kind }),
-            Some(_) => unreachable!("Entire stream should be consumed on successful parsed"),
+            Some(_) => unreachable!("Entire stream should be consumed on successful parse"),
         }
     }
 }
@@ -300,6 +300,7 @@ enum AddressToken {
 }
 
 impl AddressToken {
+    #[allow(clippy::manual_is_ascii_check)]
     pub fn parse(stream: &mut InputStream) -> Result<Option<Self>> {
         match stream.next_if_with_index(|c| matches!(c, '$' | '0'..='9')) {
             None => Ok(None),
@@ -403,7 +404,7 @@ impl<'input> InputStream<'input> {
 
     fn consume(&mut self, start: usize) -> &'input str {
         let mut end = start;
-        while let Some((start, _)) = self.stream.next() {
+        for (start, _) in self.stream.by_ref() {
             end = start;
         }
         &self.input[start..=end]
