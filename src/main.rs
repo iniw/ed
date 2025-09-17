@@ -32,7 +32,7 @@ fn main() -> Result<()> {
         };
 
         // Strip off the newline
-        let input = &input[..input.len() - 1];
+        input.pop();
 
         if let Err(err) = editor.interpret(input) {
             if args.debug {
@@ -72,10 +72,17 @@ impl Args {
 }
 
 #[derive(Debug)]
+enum Mode {
+    Command,
+    Insert,
+}
+
+#[derive(Debug)]
 struct Editor {
     current_address: usize,
     lines: Vec<String>,
     default_filename: Option<String>,
+    mode: Mode,
 }
 
 impl Editor {
@@ -84,19 +91,20 @@ impl Editor {
             return Err("Failed to open file");
         };
 
+        if let Ok(metadata) = file.metadata() {
+            println!("{}", metadata.size());
+        }
+
         let lines = BufReader::new(file)
             .lines()
             .map_while(io::Result::ok)
             .collect::<Vec<String>>();
 
-        if let Ok(metadata) = fs::metadata(&path) {
-            println!("{}", metadata.size());
-        }
-
         Ok(Self {
             current_address: lines.len(),
             lines,
             default_filename: Some(path),
+            mode: Mode::Command,
         })
     }
 
@@ -105,30 +113,50 @@ impl Editor {
             current_address: 1,
             lines: Vec::new(),
             default_filename: None,
+            mode: Mode::Command,
         }
     }
 
-    pub fn interpret(&mut self, input: &str) -> Result<()> {
-        let command = Command::parse(input)?;
-        self.execute(command)
+    pub fn interpret(&mut self, input: String) -> Result<()> {
+        match self.mode {
+            Mode::Command => {
+                let command = Command::parse(&input)?;
+                self.execute(command)
+            }
+            Mode::Insert => {
+                if input == "." {
+                    self.mode = Mode::Command;
+                } else {
+                    self.lines.insert(self.current_address, input);
+                    self.current_address += 1;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn execute(&mut self, command: Command) -> Result<()> {
         let range = self.resolve_address(&command)?;
 
+        use CommandToken::*;
         match command.kind {
-            CommandToken::Print => {
-                println!("{}", self.lines[range.clone()].join("\n"));
+            PrintAndSet => {
                 self.current_address = *range.end() + 1;
-            }
-            CommandToken::PrintAndSet => {
                 println!("{}", self.lines[*range.start()]);
-                self.current_address = *range.end() + 1;
             }
-            CommandToken::Edit(path) => {
+            Print => {
+                self.current_address = *range.end() + 1;
+                println!("{}", self.lines[range].join("\n"));
+            }
+
+            Edit(path) => {
+                let Some(path) = path.or(self.default_filename.as_deref()) else {
+                    return Err("Missing path to write");
+                };
+
                 *self = Editor::from_file(path.to_owned())?;
             }
-            CommandToken::Write(path) => {
+            Write(path) => {
                 let Some(path) = path.or(self.default_filename.as_deref()) else {
                     return Err("Missing path to write");
                 };
@@ -146,19 +174,47 @@ impl Editor {
 
                 self.default_filename = Some(path.to_owned());
             }
+
+            Append => {
+                self.current_address = *range.start() + 1;
+                self.mode = Mode::Insert;
+            }
+            Insert => {
+                self.current_address = *range.start();
+                self.mode = Mode::Insert;
+            }
+            Change => {
+                self.current_address = *range.start();
+                self.lines.drain(range);
+                self.mode = Mode::Insert;
+            }
+
+            Delete => {
+                self.current_address = *range.end() + 1;
+                self.lines.drain(range);
+            }
         }
 
         Ok(())
     }
 
     fn resolve_address(&self, command: &Command) -> Result<RangeInclusive<usize>> {
+        use CommandToken::*;
+        let current_address = (self.current_address, self.current_address);
         let (start, end) = match command.address {
             None => match command.kind {
-                CommandToken::Print => (self.current_address, self.current_address),
-                CommandToken::PrintAndSet => (self.current_address + 1, self.current_address + 1),
+                PrintAndSet => (self.current_address + 1, self.current_address + 1),
+                Print => current_address,
+
                 // FIXME: Get rid of this dummy range
-                CommandToken::Edit(_) => return Ok(0..=0),
-                CommandToken::Write(_) => (1, self.lines.len()),
+                Edit(_) => return Ok(usize::MAX..=usize::MAX),
+                Write(_) => (1, self.lines.len()),
+
+                Append => current_address,
+                Insert => current_address,
+                Change => current_address,
+
+                Delete => current_address,
             },
             Some(address) => match address {
                 Address::Single(single) => {
@@ -198,14 +254,14 @@ struct Command<'input> {
 
 impl<'input> Command<'input> {
     pub fn parse(input: &'input str) -> Result<Self> {
-        let mut stream = input.char_indices().peekable();
+        let mut stream = InputStream::from_input(input);
 
-        let address = Address::parse(&mut stream, input)?;
-        let kind = CommandToken::parse(&mut stream, input)?;
+        let address = Address::parse(&mut stream)?;
+        let kind = CommandToken::parse(&mut stream)?;
 
         match stream.next() {
             None => Ok(Command { address, kind }),
-            Some(_) => Err("Extra characters in stream"),
+            Some(_) => unreachable!("Entire stream should be consumed on successful parsed"),
         }
     }
 }
@@ -220,14 +276,14 @@ enum Address {
 }
 
 impl Address {
-    pub fn parse(stream: &mut InputStream, command: &str) -> Result<Option<Self>> {
-        let Some(start) = AddressToken::parse(stream, command)? else {
+    pub fn parse(stream: &mut InputStream) -> Result<Option<Self>> {
+        let Some(start) = AddressToken::parse(stream)? else {
             return Ok(None);
         };
 
-        let address = match stream.next_if(|(_, c)| *c == ',') {
+        let address = match stream.next_if_eq(',') {
             None => Address::Single(start),
-            Some(_) => match AddressToken::parse(stream, command)? {
+            Some(_) => match AddressToken::parse(stream)? {
                 None => Address::Single(start),
                 Some(end) => Address::Range { start, end },
             },
@@ -244,22 +300,15 @@ enum AddressToken {
 }
 
 impl AddressToken {
-    pub fn parse(stream: &mut InputStream, command: &str) -> Result<Option<Self>> {
-        match stream.next_if(|(_, c)| matches!(c, '$' | '0'..='9')) {
+    pub fn parse(stream: &mut InputStream) -> Result<Option<Self>> {
+        match stream.next_if_with_index(|c| matches!(c, '$' | '0'..='9')) {
             None => Ok(None),
             Some((_, '$')) => Ok(Some(AddressToken::Dollar)),
             Some((start, '0'..='9')) => {
-                let mut end = start;
-
-                #[allow(clippy::manual_is_ascii_check)]
-                while let Some((start, _)) = stream.next_if(|(_, c)| matches!(c, '0'..='9')) {
-                    end = start;
-                }
-
-                let Ok(number) = command[start..=end].parse() else {
+                let str = stream.consume_while(start, |c| matches!(c, '0'..='9'));
+                let Ok(number) = str.parse() else {
                     return Err("Failed to parse numeric address");
                 };
-
                 Ok(Some(AddressToken::Number(number)))
             }
             _ => unreachable!(),
@@ -269,38 +318,104 @@ impl AddressToken {
 
 #[derive(Debug)]
 enum CommandToken<'input> {
-    Print,
     PrintAndSet,
-    Edit(&'input str),
+    Print,
+
+    Edit(Option<&'input str>),
     Write(Option<&'input str>),
+
+    Append,
+    Insert,
+    Change,
+
+    Delete,
 }
 
 impl<'input> CommandToken<'input> {
-    pub fn parse(stream: &mut InputStream, input: &'input str) -> Result<Self> {
-        let swallow = |stream: &mut InputStream| {
-            stream.next().map(|(start, _)| {
-                let mut end = start;
-                while let Some((start, _)) = stream.next() {
-                    end = start;
+    pub fn parse(stream: &mut InputStream<'input>) -> Result<Self> {
+        let swallow = |stream: &mut InputStream<'input>| match stream.next() {
+            Some(c) if c.is_whitespace() => {
+                // Consume leading whitespace
+                while stream.next_if(char::is_whitespace).is_some() {}
+
+                match stream.next_with_index() {
+                    Some((start, _)) => Ok(Some(stream.consume(start))),
+                    None => Err("Missing argument for command"),
                 }
-                &input[start..=end]
-            })
+            }
+            Some(_) => Err("Expected space after command"),
+            None => Ok(None),
         };
-        match stream.next().map(|(_, c)| c) {
-            None => Ok(CommandToken::PrintAndSet),
-            Some('p') => Ok(CommandToken::Print),
-            Some('e') => match swallow(stream) {
-                Some(path) => Ok(CommandToken::Edit(path.trim_start())),
-                None => Err("Missing path for `Edit`"),
-            },
-            Some('w') => Ok(CommandToken::Write(
-                swallow(stream).map(|path| path.trim_start()),
-            )),
-            _ => Err("Unknown command"),
-        }
+
+        use CommandToken::*;
+        let command = match stream.next() {
+            None => PrintAndSet,
+            Some('p') => Print,
+
+            Some('e') => Edit(swallow(stream)?),
+            Some('w') => Write(swallow(stream)?),
+
+            Some('a') => Append,
+            Some('i') => Insert,
+            Some('c') => Change,
+
+            Some('d') => Delete,
+
+            _ => return Err("Unknown command"),
+        };
+
+        Ok(command)
     }
 }
 
-type InputStream<'a> = Peekable<CharIndices<'a>>;
+struct InputStream<'input> {
+    input: &'input str,
+    stream: Peekable<CharIndices<'input>>,
+}
+
+impl<'input> InputStream<'input> {
+    fn from_input(input: &'input str) -> Self {
+        Self {
+            input,
+            stream: input.char_indices().peekable(),
+        }
+    }
+
+    fn next(&mut self) -> Option<char> {
+        self.stream.next().map(|(_, c)| c)
+    }
+
+    fn next_if(&mut self, f: impl FnOnce(char) -> bool) -> Option<char> {
+        self.stream.next_if(|(_, c)| f(*c)).map(|(_, c)| c)
+    }
+
+    fn next_if_eq(&mut self, c: char) -> Option<char> {
+        self.next_if(|nc| nc == c)
+    }
+
+    fn next_with_index(&mut self) -> Option<(usize, char)> {
+        self.stream.next()
+    }
+
+    fn next_if_with_index(&mut self, f: impl FnOnce(char) -> bool) -> Option<(usize, char)> {
+        self.stream.next_if(|(_, c)| f(*c))
+    }
+
+    fn consume(&mut self, start: usize) -> &'input str {
+        let mut end = start;
+        while let Some((start, _)) = self.stream.next() {
+            end = start;
+        }
+        &self.input[start..=end]
+    }
+
+    fn consume_while(&mut self, start: usize, f: impl Fn(char) -> bool) -> &'input str {
+        let mut end = start;
+        while let Some((start, _)) = self.next_if_with_index(&f) {
+            end = start;
+        }
+        &self.input[start..=end]
+    }
+}
 
 type Result<T> = std::result::Result<T, &'static str>;
